@@ -1,0 +1,38 @@
+# Robot Vision System Dependencies
+# =================================
+
+# === Server Dependencies ===
+# FastAPI + ASGI server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# YOLOv11 (Ultralytics)
+# Note: For GPU support (CUDA 12.x), install PyTorch with CUDA first:
+# pip install torch>=2.0.0 torchvision>=0.15.0 --index-url https://download.pytorch.org/whl/cu121
+# Then install: pip install ultralytics>=8.3.0
+# 
+# For CUDA 11.8: pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
+# For CPU only: pip install torch>=2.0.0
+ultralytics>=8.3.0
+
+# Image processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# API models
+pydantic>=2.0.0
+
+# === Client Dependencies (Raspberry Pi) ===
+# HTTP client
+requests>=2.31.0
+
+# Serial communication (Arduino)
+pyserial>=3.5
+
+# For Raspberry Pi Camera (uncomment if using Pi)
+# picamera2>=0.3.12
+
+# === Development ===
+# httpx>=0.25.0  # For async testing
