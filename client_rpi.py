@@ -4,12 +4,14 @@ Robot Vision Client - Raspberry Pi
 Captures images, sends to FastAPI server, receives commands, controls motors.
 
 Modes:
-1. Real-time Tracking - Continuous single-image detection
+1. Real-time Tracking - Continuous single-image detection with live stream
 2. Multi-view Finding - 3-view scan with servo control
-3. Stream Mode - Server pulls from Pi's stream endpoint
+3. Manual Control - Poll for commands from web UI
 
-Note: For stream mode, run rpi_stream_server.py first, then let the
-      vision server pull frames from the stream.
+Features:
+- Integrated stream server with object detection visualization
+- Live video feed showing bounding boxes, labels, and tracking info
+- Real-time detection results overlaid on video stream
 
 Run: python client_rpi.py --server http://SERVER_IP:8000
 """
@@ -23,12 +25,18 @@ import threading
 import socket
 import subprocess
 import sys
+import os
+import glob
 from enum import Enum
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 
 # === Configuration ===
@@ -36,7 +44,7 @@ import numpy as np
 @dataclass
 class Config:
     server_url: str = "http://localhost:8000"
-    serial_port: str = "/dev/ttyUSB0"
+    serial_port: str = "/dev/ttyACM0"  # Arduino Uno R3 uses ACM, not USB
     baudrate: int = 9600
     camera_width: int = 640
     camera_height: int = 480
@@ -68,43 +76,146 @@ class MotorController:
         "servo_right": "SR",
     }
     
+    def _find_arduino_port(self, preferred_port: str = None):
+        """Try to find Arduino port automatically."""
+        import glob
+        
+        # Common Arduino port patterns
+        possible_ports = []
+        
+        # If preferred port is specified, try it first
+        if preferred_port:
+            possible_ports.append(preferred_port)
+        
+        # Try ACM ports first (Arduino Uno R3 uses CDC ACM)
+        possible_ports.extend(sorted(glob.glob('/dev/ttyACM*')))
+        # Then try USB serial ports
+        possible_ports.extend(sorted(glob.glob('/dev/ttyUSB*')))
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_ports = []
+        for port in possible_ports:
+            if port not in seen:
+                seen.add(port)
+                unique_ports.append(port)
+        
+        return unique_ports
+    
     def __init__(self, port: str, baudrate: int):
         self.ser = None
         self.connected = False
         self.rotation_ack = threading.Event()
         
-        try:
-            self.ser = serial.Serial(port=port, baudrate=baudrate, timeout=1)
-            time.sleep(2)
-            self.connected = True
-            print(f"✓ Arduino connected on {port}")
-            
-            self._listener = threading.Thread(target=self._listen, daemon=True)
-            self._listener.start()
-        except Exception as e:
-            print(f"⚠ Serial error: {e}")
-            print("  Running in SIMULATION mode (no motors)")
+        # Try to find Arduino port if default doesn't work
+        ports_to_try = self._find_arduino_port(port)
+        
+        print(f"🔌 Attempting to connect to Arduino via USB...")
+        print(f"   Trying ports: {', '.join(ports_to_try)}")
+        print(f"   Baudrate: {baudrate}")
+        
+        last_error = None
+        for attempt_port in ports_to_try:
+            try:
+                print(f"   Trying {attempt_port}...")
+                self.ser = serial.Serial(port=attempt_port, baudrate=baudrate, timeout=1)
+                time.sleep(2)  # Wait for Arduino to initialize
+                
+                # Test connection by checking if port is open
+                if self.ser.is_open:
+                    print(f"✓ USB Serial port opened successfully on {attempt_port}")
+                    # Try to flush any existing data
+                    self.ser.reset_input_buffer()
+                    self.ser.reset_output_buffer()
+                    print(f"✓ Input/output buffers cleared")
+                    
+                    self.connected = True
+                    print(f"✓ Arduino connected via USB on {attempt_port} (baudrate: {baudrate})")
+                    print(f"   Waiting for Arduino messages...")
+                    
+                    self._listener = threading.Thread(target=self._listen, daemon=True)
+                    self._listener.start()
+                    print(f"✓ USB listener thread started")
+                    return  # Successfully connected, exit
+                else:
+                    self.ser.close()
+                    raise Exception("Serial port opened but is not open")
+            except serial.SerialException as e:
+                print(f"   ✗ Failed: {e}")
+                last_error = e
+                if self.ser:
+                    try:
+                        self.ser.close()
+                    except:
+                        pass
+                self.ser = None
+                continue  # Try next port
+            except Exception as e:
+                print(f"   ✗ Failed: {e}")
+                last_error = e
+                if self.ser:
+                    try:
+                        self.ser.close()
+                    except:
+                        pass
+                self.ser = None
+                continue  # Try next port
+        
+        # If we get here, all ports failed
+        print(f"⚠ Failed to connect to Arduino on any port")
+        print(f"   Last error: {last_error}")
+        print(f"   Check:")
+        print(f"   1. Arduino is connected via USB")
+        print(f"   2. Arduino is powered on")
+        print(f"   3. Check available ports: ls -l /dev/ttyACM* /dev/ttyUSB*")
+        print(f"   4. No other program is using the port (try: lsof | grep tty)")
+        print(f"   5. User has permissions (may need: sudo usermod -a -G dialout $USER)")
+        print(f"   6. Try specifying port manually: --port /dev/ttyACM0")
+        print("  Running in SIMULATION mode (no motors)")
     
     def _listen(self):
-        """Listen for Arduino messages."""
+        """Listen for Arduino messages via USB serial."""
+        print(f"📡 USB listener started - waiting for Arduino messages...")
         while True:
-            if self.ser and self.ser.in_waiting:
+            if self.ser and self.ser.is_open:
                 try:
-                    line = self.ser.readline().decode('utf-8', errors='replace').strip()
-                    if line:
-                        print(f"  [Arduino] {line}")
-                        if "ROTATION_ACK" in line:
-                            self.rotation_ack.set()
-                except Exception:
-                    pass
+                    if self.ser.in_waiting > 0:
+                        line = self.ser.readline().decode('utf-8', errors='replace').strip()
+                        if line:
+                            print(f"📥 [USB RX] {line}")
+                            if "ROTATION_ACK" in line:
+                                self.rotation_ack.set()
+                                print(f"   ✓ ROTATION_ACK received - servo movement complete")
+                    else:
+                        # No data available, just wait
+                        pass
+                except UnicodeDecodeError as e:
+                    print(f"⚠ [USB RX Decode Error] {e} - received invalid data")
+                except Exception as e:
+                    print(f"⚠ [USB RX Error] {e}")
+            else:
+                # Serial port not available
+                if self.ser is None:
+                    break
             time.sleep(0.05)
     
     def send(self, cmd: str):
-        """Send raw command."""
-        print(f"  >> {cmd}")
-        if self.ser:
-            self.ser.write((cmd + "\n").encode('utf-8'))
-            self.ser.flush()
+        """Send raw command via USB serial."""
+        print(f"📤 [USB TX] {cmd}")
+        if self.ser and self.ser.is_open:
+            try:
+                cmd_bytes = (cmd + "\n").encode('utf-8')
+                bytes_written = self.ser.write(cmd_bytes)
+                self.ser.flush()
+                print(f"   ✓ Sent {bytes_written} bytes")
+            except serial.SerialTimeoutException:
+                print(f"⚠ [USB TX Timeout] Command '{cmd}' timed out")
+            except serial.SerialException as e:
+                print(f"⚠ [USB TX Serial Error] {e}")
+            except Exception as e:
+                print(f"⚠ [USB TX Error] {e}")
+        else:
+            print(f"⚠ [USB TX] Cannot send - serial port not open (SIMULATION MODE)")
     
     def move(self, direction: str, duration: float = 0):
         """Move in direction."""
@@ -153,23 +264,130 @@ class Camera:
         self.camera = None
         self._init_camera()
     
+    def _list_video_devices(self):
+        """List available video devices."""
+        video_devices = []
+        for device_path in glob.glob('/dev/video*'):
+            if os.path.exists(device_path):
+                video_devices.append(device_path)
+        return sorted(video_devices)
+    
     def _init_camera(self):
         """Initialize USB webcam."""
-        self.camera = cv2.VideoCapture(self.config.camera_index)
-        if not self.camera.isOpened():
-            print(f"Warning: Camera index {self.config.camera_index} failed, trying next...")
-            self.camera = cv2.VideoCapture(self.config.camera_index + 1)
+        print(f"Initializing USB Webcam (index {self.config.camera_index})...")
+        
+        # First, check available video devices
+        video_devices = self._list_video_devices()
+        if video_devices:
+            print(f"Found video devices: {', '.join(video_devices)}")
+        else:
+            print("⚠ No /dev/video* devices found!")
+            print("  Troubleshooting:")
+            print("    1. Check camera is connected: lsusb")
+            print("    2. Check permissions: ls -l /dev/video*")
+            print("    3. Add user to video group: sudo usermod -a -G video $USER")
+            print("    4. Reboot or logout/login after adding to group")
+        
+        camera_found = False
+        
+        # Method 1: Try by device path first (more reliable)
+        if video_devices:
+            print("\nTrying to open by device path...")
+            for device_path in video_devices:
+                try:
+                    # Try opening with device path
+                    self.camera = cv2.VideoCapture(device_path)
+                    if self.camera.isOpened():
+                        ret, test_frame = self.camera.read()
+                        if ret and test_frame is not None:
+                            camera_found = True
+                            print(f"✓ Camera opened successfully: {device_path}")
+                            break
+                        else:
+                            self.camera.release()
+                            print(f"  {device_path} opened but cannot read frames")
+                    else:
+                        self.camera.release()
+                except Exception as e:
+                    print(f"  Error opening {device_path}: {e}")
+        
+        # Method 2: Try by index if device path failed
+        if not camera_found:
+            print("\nTrying to open by index...")
+            for idx in range(self.config.camera_index, self.config.camera_index + 5):
+                try:
+                    self.camera = cv2.VideoCapture(idx)
+                    if self.camera.isOpened():
+                        ret, test_frame = self.camera.read()
+                        if ret and test_frame is not None:
+                            camera_found = True
+                            self.config.camera_index = idx
+                            print(f"✓ USB Webcam found and working (index {idx})")
+                            break
+                        else:
+                            self.camera.release()
+                            print(f"  Camera index {idx} opened but cannot read frames")
+                    else:
+                        if idx == self.config.camera_index:
+                            print(f"  Camera index {idx} not available")
+                except Exception as e:
+                    print(f"  Error with index {idx}: {e}")
+        
+        if not camera_found:
+            error_msg = "\n" + "=" * 60
+            error_msg += "\n❌ CAMERA INITIALIZATION FAILED"
+            error_msg += "\n" + "=" * 60
+            error_msg += "\n\nTroubleshooting Steps:"
+            error_msg += "\n1. Check camera connection:"
+            error_msg += "\n   lsusb | grep -i camera"
+            error_msg += "\n   lsusb | grep -i video"
+            error_msg += "\n\n2. Check video devices:"
+            error_msg += "\n   ls -l /dev/video*"
+            error_msg += "\n\n3. Fix permissions (if needed):"
+            error_msg += "\n   sudo usermod -a -G video $USER"
+            error_msg += "\n   # Then logout and login again"
+            error_msg += "\n\n4. Test camera manually:"
+            error_msg += "\n   v4l2-ctl --list-devices"
+            error_msg += "\n   v4l2-ctl --device=/dev/video0 --all"
+            error_msg += "\n\n5. Try different camera:"
+            error_msg += "\n   python client_rpi.py --camera 1"
+            error_msg += "\n\n6. Check if another process is using camera:"
+            error_msg += "\n   lsof | grep video"
+            error_msg += "\n" + "=" * 60
+            raise RuntimeError(error_msg)
+        
+        # Set camera properties
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
         self.camera.set(cv2.CAP_PROP_FPS, 30)
-        print(f"✓ USB Webcam initialized (index {self.config.camera_index})")
-        time.sleep(2)
+        
+        # Verify settings
+        actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"  Resolution: {actual_width}x{actual_height}")
+        time.sleep(2)  # Camera warm-up
+        
+        # Test capture
+        ret, frame = self.camera.read()
+        if not ret or frame is None:
+            raise RuntimeError("Camera initialized but cannot capture frames")
+        print(f"✓ Camera test capture successful")
     
     def capture(self) -> Optional[np.ndarray]:
         """Capture a frame from USB webcam."""
+        if self.camera is None or not self.camera.isOpened():
+            print("⚠ Camera not initialized or closed")
+            return None
+        
         ret, frame = self.camera.read()
         if not ret:
+            print("⚠ Failed to read frame from camera")
             return None
+        
+        if frame is None or frame.size == 0:
+            print("⚠ Camera returned empty frame")
+            return None
+        
         return frame
     
     def capture_jpeg(self) -> Optional[bytes]:
@@ -271,6 +489,18 @@ class VisionClient:
         except Exception:
             return False
     
+    def poll_control_command(self) -> Optional[str]:
+        """Poll server for manual control command."""
+        try:
+            resp = self.session.get(f"{self.server_url}/control/poll", timeout=2)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("has_command"):
+                    return data.get("command")
+            return None
+        except Exception:
+            return None
+    
     def start_stream(self, stream_url: str, target_class: str = "person", 
                      confidence: float = 0.4, interval_ms: int = 100):
         """Start server-side stream processing."""
@@ -307,6 +537,396 @@ class VisionClient:
             return {"success": False, "error": str(e)}
 
 
+# === Integrated Stream Server ===
+
+class IntegratedStreamServer:
+    """Integrated stream server with detection visualization."""
+    
+    def __init__(self, camera: Camera, vision_client: VisionClient, config: Config):
+        self.camera = camera
+        self.vision_client = vision_client
+        self.config = config
+        self.frame: Optional[np.ndarray] = None
+        self.detection_result: Optional[Dict[str, Any]] = None
+        self.frame_lock = threading.Lock()
+        self.running = False
+        self.frame_count = 0
+        self.fps_actual = 0
+        self._last_fps_time = time.time()
+        self._fps_frame_count = 0
+        
+        # FastAPI app for streaming
+        self.app = FastAPI(
+            title="Raspberry Pi Camera Stream with Detection",
+            description="Live video streaming with object detection visualization",
+            version="2.0.0"
+        )
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        self._setup_routes()
+        # Don't start capture thread yet - wait for stream processor to start
+        # self._start_capture_thread() will be called after stream processor starts
+    
+    def _get_local_ip(self) -> str:
+        """Get local IP address."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "localhost"
+    
+    def _setup_routes(self):
+        """Setup FastAPI routes."""
+        
+        @self.app.get("/", response_class=HTMLResponse)
+        async def index():
+            """Web page with video player."""
+            pi_ip = self._get_local_ip()
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Live Detection Stream</title>
+                <style>
+                    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, sans-serif;
+                        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                        min-height: 100vh;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        padding: 20px;
+                        color: #eee;
+                    }}
+                    h1 {{ margin-bottom: 20px; font-size: 2em; }}
+                    .container {{
+                        background: rgba(255,255,255,0.1);
+                        border-radius: 15px;
+                        padding: 20px;
+                        box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+                    }}
+                    img {{
+                        border-radius: 10px;
+                        max-width: 100%;
+                        height: auto;
+                        border: 2px solid #667eea;
+                    }}
+                </style>
+            </head>
+            <body>
+                <h1>🎥 Live Detection Stream</h1>
+                <div class="container">
+                    <img src="/video_feed" alt="Live Stream">
+                </div>
+            </body>
+            </html>
+            """
+            return html
+        
+        def _generate_video_feed():
+            """Internal generator for video feed."""
+            frame_count = 0
+            while True:
+                try:
+                    frame = self.get_annotated_frame()
+                    if frame is not None:
+                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if buffer is not None and len(buffer) > 0:
+                            frame_count += 1
+                            if frame_count % 30 == 0:  # Log every 30 frames
+                                print(f"📹 Streaming frame {frame_count}")
+                            yield (b'--frame\r\n'
+                                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    else:
+                        # No frame available yet, send a placeholder or wait
+                        if frame_count == 0:
+                            print("⚠ No frame available yet, waiting for camera...")
+                        time.sleep(0.1)
+                except Exception as e:
+                    print(f"⚠ Video feed generation error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    time.sleep(0.1)
+                time.sleep(1.0 / 30)
+        
+        @self.app.get("/video_feed")
+        async def video_feed():
+            """MJPEG video stream with detection overlay."""
+            print("📹 Video feed endpoint accessed")
+            return StreamingResponse(
+                _generate_video_feed(),
+                media_type="multipart/x-mixed-replace; boundary=frame"
+            )
+        
+        @self.app.get("//video_feed")
+        async def video_feed_double_slash():
+            """Handle double slash case - serve stream directly."""
+            print("📹 Video feed endpoint accessed (double slash)")
+            return StreamingResponse(
+                _generate_video_feed(),
+                media_type="multipart/x-mixed-replace; boundary=frame"
+            )
+        
+        @self.app.get("/api/frame")
+        async def get_frame():
+            """Get raw frame for API."""
+            frame = self.get_annotated_frame()
+            if frame is not None:
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                return Response(content=buffer.tobytes(), media_type="image/jpeg")
+            return Response(status_code=503, content="Camera not ready")
+        
+        @self.app.get("/api/status")
+        async def get_status():
+            """Get stream status."""
+            return {
+                "status": "streaming" if self.running else "stopped",
+                "resolution": f"{self.config.camera_width}x{self.config.camera_height}",
+                "fps_actual": round(self.fps_actual, 1),
+                "frame_count": self.frame_count,
+                "has_frame": self.frame is not None,
+                "capture_running": self.running
+            }
+        
+        @self.app.get("/test")
+        async def test():
+            """Test endpoint to verify server is running."""
+            return {
+                "status": "ok",
+                "message": "Stream server is running",
+                "routes": ["/", "/video_feed", "/api/frame", "/api/status", "/test"]
+            }
+        
+        # Handle double slash case (redirect)
+        @self.app.get("//video_feed")
+        async def video_feed_double_slash():
+            """Redirect double slash to single slash."""
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url="/video_feed", status_code=301)
+    
+    def _draw_detections(self, frame: np.ndarray, detection_result: Dict[str, Any]) -> np.ndarray:
+        """Draw detection bounding boxes on frame."""
+        if not detection_result.get("success") or not detection_result.get("target_found"):
+            # Still draw timestamp and FPS even if no detection
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(frame, timestamp, (10, frame.shape[0] - 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(frame, f"FPS: {self.fps_actual:.1f}", (10, frame.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Show appropriate message based on mode
+            message = detection_result.get("message", "Live Feed Active")
+            if "waiting for detection" in message.lower() or "live feed active" in message.lower():
+                cv2.putText(frame, "LIVE FEED", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, "Manual Control Mode", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            else:
+                cv2.putText(frame, f"Target: {self.config.target_class}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, "Searching...", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return frame
+        
+        # Draw all detections
+        all_detections = detection_result.get("all_detections", [])
+        for det in all_detections:
+            bbox = det.get("bbox", [])
+            if len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                class_name = det.get("class_name", "unknown")
+                confidence = det.get("confidence", 0.0)
+                is_target = det.get("class_name") == self.config.target_class
+                
+                # Color: green for target, blue for others
+                color = (0, 255, 0) if is_target else (255, 0, 0)
+                thickness = 3 if is_target else 2
+                
+                # Draw bounding box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                
+                # Draw label
+                label = f"{class_name} {confidence:.2f}"
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
+                            (x1 + label_size[0], y1), color, -1)
+                cv2.putText(frame, label, (x1, y1 - 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Highlight target detection
+        target_det = detection_result.get("target_detection")
+        if target_det:
+            bbox = target_det.get("bbox", [])
+            if len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                # Draw thicker box for target
+                cv2.rectangle(frame, (x1-2, y1-2), (x2+2, y2+2), (0, 255, 255), 3)
+                
+                # Draw direction indicator
+                direction = detection_result.get("direction", "none")
+                centroid = target_det.get("centroid", [x1 + (x2-x1)//2, y1 + (y2-y1)//2])
+                cx, cy = centroid
+                
+                # Draw direction arrow
+                if direction == "left":
+                    cv2.arrowedLine(frame, (cx, cy), (cx - 50, cy), (0, 255, 255), 3, tipLength=0.3)
+                elif direction == "right":
+                    cv2.arrowedLine(frame, (cx, cy), (cx + 50, cy), (0, 255, 255), 3, tipLength=0.3)
+                elif direction == "center":
+                    cv2.circle(frame, (cx, cy), 10, (0, 255, 255), -1)
+                
+                # Draw tracking info
+                tracking = detection_result.get("tracking")
+                if tracking:
+                    velocity = tracking.get("velocity", [0, 0])
+                    info_text = f"ID:{tracking.get('object_id', 0)} Vel:({velocity[0]:.1f},{velocity[1]:.1f})"
+                    cv2.putText(frame, info_text, (x1, y2 + 20),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        
+        # Draw status overlay
+        status_y = 30
+        cv2.putText(frame, f"Target: {self.config.target_class}", (10, status_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        direction = detection_result.get("direction", "none")
+        if detection_result.get("target_found"):
+            status_text = f"Found: {direction.upper()}"
+            if detection_result.get("reached"):
+                status_text += " - REACHED!"
+            cv2.putText(frame, status_text, (10, status_y + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, "Searching...", (10, status_y + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Draw timestamp and FPS
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(frame, timestamp, (10, frame.shape[0] - 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {self.fps_actual:.1f}", (10, frame.shape[0] - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return frame
+    
+    def _capture_loop(self):
+        """Continuous capture and detection loop."""
+        print("📹 Capture loop started - capturing frames for live feed...")
+        while self.running:
+            try:
+                # Capture frame - always do this for live feed
+                frame = self.camera.capture()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                # Always store the frame for live feed (even without detection)
+                with self.frame_lock:
+                    self.frame = frame.copy()
+                    self.frame_count += 1
+                
+                # Try to get detection result from server (optional - live feed works without it)
+                try:
+                    detection_result = self.vision_client.detect_realtime_stream()
+                    if detection_result and detection_result.get("success"):
+                        # Update with detection results
+                        with self.frame_lock:
+                            self.detection_result = detection_result
+                    else:
+                        # No detection available - that's fine for live feed
+                        with self.frame_lock:
+                            self.detection_result = {
+                                "success": False,
+                                "target_found": False,
+                                "message": "Live feed active"
+                            }
+                except Exception:
+                    # Stream processor not running - that's fine, just show raw feed
+                    with self.frame_lock:
+                        self.detection_result = {
+                            "success": False,
+                            "target_found": False,
+                            "message": "Live feed active"
+                        }
+                
+                # Calculate FPS
+                self._fps_frame_count += 1
+                now = time.time()
+                if now - self._last_fps_time >= 1.0:
+                    self.fps_actual = self._fps_frame_count / (now - self._last_fps_time)
+                    self._fps_frame_count = 0
+                    self._last_fps_time = now
+                
+                time.sleep(0.033)  # ~30 FPS
+                
+            except Exception as e:
+                print(f"⚠ Capture loop error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
+    
+    def _start_capture_thread(self):
+        """Start background capture thread."""
+        if self.running:
+            print("⚠ Capture thread already running")
+            return
+        self.running = True
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+        print("✓ Capture thread started - frames will be available for live feed")
+    
+    def get_annotated_frame(self) -> Optional[np.ndarray]:
+        """Get frame with detection annotations."""
+        with self.frame_lock:
+            if self.frame is not None:
+                if self.detection_result is not None:
+                    annotated = self._draw_detections(self.frame.copy(), self.detection_result)
+                    return annotated
+                else:
+                    # No detection result yet, just return raw frame with basic overlay
+                    frame = self.frame.copy()
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    cv2.putText(frame, timestamp, (10, frame.shape[0] - 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(frame, f"FPS: {self.fps_actual:.1f}", (10, frame.shape[0] - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(frame, "LIVE FEED", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    return frame
+        return None
+    
+    def stop(self):
+        """Stop stream server."""
+        self.running = False
+        time.sleep(0.2)
+        print("Stream server stopped")
+    
+    def run_server(self, port: int):
+        """Run FastAPI server."""
+        pi_ip = self._get_local_ip()
+        print(f"\n🌐 Stream server running at:")
+        print(f"   http://{pi_ip}:{port}/")
+        print(f"   http://{pi_ip}:{port}/video_feed")
+        print(f"   http://{pi_ip}:{port}/test (test endpoint)")
+        print(f"\n📋 Available routes:")
+        print(f"   GET  /              - Web page with video player")
+        print(f"   GET  /video_feed    - MJPEG video stream")
+        print(f"   GET  /api/frame     - Single frame snapshot")
+        print(f"   GET  /api/status    - Stream status")
+        print(f"   GET  /test          - Test endpoint")
+        print()
+        uvicorn.run(self.app, host="0.0.0.0", port=port, log_level="info")
+
+
 # === Main Robot Controller ===
 
 class RobotController:
@@ -314,12 +934,39 @@ class RobotController:
     
     def __init__(self, config: Config):
         self.config = config
-        self.camera = Camera(config)
+        print("\n" + "=" * 50)
+        print("  INITIALIZING ROBOT CONTROLLER")
+        print("=" * 50)
+        
+        # Initialize camera first
+        print("\n[1/3] Initializing camera...")
+        try:
+            self.camera = Camera(config)
+            # Test camera capture
+            test_frame = self.camera.capture()
+            if test_frame is not None:
+                print(f"✓ Camera test successful - Frame shape: {test_frame.shape}")
+            else:
+                raise RuntimeError("Camera test capture failed")
+        except Exception as e:
+            print(f"✗ Camera initialization failed: {e}")
+            raise
+        
+        # Initialize motors
+        print("\n[2/3] Initializing motor controller...")
         self.motors = MotorController(config.serial_port, config.baudrate)
+        
+        # Initialize API client
+        print("\n[3/3] Connecting to vision server...")
         self.client = VisionClient(config.server_url)
+        
         self.running = False
-        self.stream_process = None
+        self.stream_server = None
+        self.stream_server_thread = None
         self.stream_url = None
+        
+        print("\n✓ Robot controller initialized successfully!")
+        print("=" * 50 + "\n")
     
     def _get_local_ip(self) -> str:
         """Get local IP address."""
@@ -333,39 +980,63 @@ class RobotController:
             return "localhost"
     
     def _start_stream_server(self):
-        """Start stream server in background process."""
-        if self.stream_process:
-            return
+        """Start integrated stream server in background thread."""
+        if self.stream_server:
+            return True
         
         try:
-            # Start stream server as subprocess
-            cmd = [
-                sys.executable, "rpi_stream_server.py",
-                "--port", str(self.config.stream_port),
-                "--camera", str(self.config.camera_index),
-                "--width", str(self.config.camera_width),
-                "--height", str(self.config.camera_height)
-            ]
-            self.stream_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            print("Starting integrated stream server with detection visualization...")
+            self.stream_server = IntegratedStreamServer(
+                self.camera,
+                self.client,
+                self.config
             )
-            time.sleep(3)  # Wait for server to start
+            
+            # Start server in background thread
             pi_ip = self._get_local_ip()
             self.stream_url = f"http://{pi_ip}:{self.config.stream_port}"
-            print(f"✓ Stream server started at {self.stream_url}")
-            return True
+            
+            def run_server():
+                try:
+                    self.stream_server.run_server(self.config.stream_port)
+                except Exception as e:
+                    print(f"Stream server error: {e}")
+            
+            self.stream_server_thread = threading.Thread(target=run_server, daemon=True)
+            self.stream_server_thread.start()
+            
+            # Wait for server to start
+            print(f"Waiting for stream server at {self.stream_url}...")
+            max_attempts = 10
+            for attempt in range(max_attempts):
+                time.sleep(1)
+                try:
+                    resp = requests.get(f"{self.stream_url}/api/status", timeout=2)
+                    if resp.status_code == 200:
+                        status = resp.json()
+                        print(f"✓ Stream server is running!")
+                        print(f"  Status: {status.get('status')}")
+                        print(f"  Resolution: {status.get('resolution')}")
+                        return True
+                except Exception:
+                    if attempt < max_attempts - 1:
+                        print(f"  Attempt {attempt + 1}/{max_attempts}...")
+                    continue
+            
+            print(f"⚠ Stream server started but not responding")
+            return False
+            
         except Exception as e:
             print(f"⚠ Failed to start stream server: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def _stop_stream_server(self):
         """Stop stream server."""
-        if self.stream_process:
-            self.stream_process.terminate()
-            self.stream_process.wait(timeout=5)
-            self.stream_process = None
+        if self.stream_server:
+            self.stream_server.stop()
+            self.stream_server = None
             print("✓ Stream server stopped")
     
     def run_realtime(self):
@@ -377,36 +1048,169 @@ class RobotController:
         
         # Start stream server if using stream mode
         if self.config.use_stream:
+            print("Starting local stream server...")
             if not self._start_stream_server():
-                print("⚠ Falling back to image-based mode")
+                print("⚠ Stream server failed, falling back to image-based mode")
                 self.config.use_stream = False
+            else:
+                print(f"✓ Stream server ready at {self.stream_url}")
         
-        # Start server-side stream processing
+        # Don't start server-side stream processing automatically
+        # Wait for user to click "Start" in the UI
         if self.config.use_stream and self.stream_url:
-            print(f"Starting server stream processing from {self.stream_url}...")
-            if not self.client.start_stream(
-                stream_url=self.stream_url,
-                target_class=self.config.target_class,
-                confidence=self.config.confidence,
-                interval_ms=100
-            ):
-                print("⚠ Failed to start server stream processing, falling back to image mode")
-                self.config.use_stream = False
+            print(f"\n⏸ Waiting for user to start operation from UI...")
+            print(f"  Stream URL: {self.stream_url}")
+            print(f"  Go to http://SERVER_IP:8000/ui and click 'Start' to begin tracking")
+            print(f"  Target will be set from UI")
+        
+        if not self.config.use_stream:
+            print("\nUsing image-based mode (sending individual frames)")
+            print("⏸ Waiting for user to start operation from UI...")
         
         self.running = True
         last_command_time = 0
         command_cooldown = 0.5
+        auto_tracking_enabled = False  # Start disabled - wait for UI to start
+        stream_processor_started = False
+        
+        # Search behavior when target not found
+        search_state = "servo_scan"  # "servo_scan", "rotate", "move_forward"
+        last_search_action_time = 0
+        search_cooldown = 1.0  # Wait 1 second between search actions
+        servo_positions = ["left", "center", "right"]
+        current_servo_index = 1  # Start at center
+        no_target_count = 0  # Count consecutive frames without target
         
         try:
             while self.running:
+                # Check for manual control commands first (priority over auto-tracking)
+                manual_command = self.client.poll_control_command()
+                if manual_command:
+                    print(f"📱 Manual command received: {manual_command}")
+                    auto_tracking_enabled = False  # Disable auto-tracking when manual command received
+                    
+                    # Execute manual command - handle ALL UI commands
+                    try:
+                        if manual_command == "stop":
+                            self.motors.stop()
+                            print("  ✓ Stopped")
+                            # Don't auto-enable tracking - wait for UI to start again
+                            
+                        elif manual_command == "forward":
+                            self.motors.move("center", 0.5)
+                            print("  ✓ Moving forward")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "backward":
+                            # Note: backward movement - rotate 180 then move forward
+                            print("  ⚠ Backward: rotating 180° then moving")
+                            self.motors.rotate_180()
+                            time.sleep(0.3)
+                            self.motors.move("center", 0.5)
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "left":
+                            self.motors.move("left", 0.5)
+                            print("  ✓ Moving left")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "right":
+                            self.motors.move("right", 0.5)
+                            print("  ✓ Moving right")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "far_left":
+                            self.motors.move("far_left", 0.5)
+                            print("  ✓ Moving far left")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "far_right":
+                            self.motors.move("far_right", 0.5)
+                            print("  ✓ Moving far right")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "rotate_180":
+                            self.motors.rotate_180()
+                            print("  ✓ Rotated 180°")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "servo_left":
+                            self.motors.rotate_servo("left")
+                            print("  ✓ Servo moved left")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "servo_center":
+                            self.motors.rotate_servo("center")
+                            print("  ✓ Servo centered")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        elif manual_command == "servo_right":
+                            self.motors.rotate_servo("right")
+                            print("  ✓ Servo moved right")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                        else:
+                            print(f"  ⚠ Unknown manual command: {manual_command}")
+                            # Don't auto-enable - tracking controlled by UI start/stop
+                            
+                    except Exception as e:
+                        print(f"  ✗ Error executing command '{manual_command}': {e}")
+                        # Don't auto-enable - tracking controlled by UI start/stop
+                    
+                    # Skip auto-tracking this cycle
+                    time.sleep(0.1)
+                    continue
+                
+                # Check if stream processor is running on server (started from UI)
+                if self.config.use_stream:
+                    # Check stream status to see if it's running
+                    try:
+                        resp = self.client.session.get(f"{self.client.server_url}/stream/status", timeout=2)
+                        if resp.status_code == 200:
+                            status_data = resp.json()
+                            if status_data.get("active") and not stream_processor_started:
+                                stream_processor_started = True
+                                auto_tracking_enabled = True
+                                print("✓ Stream processor started from UI - beginning auto-tracking")
+                                # Start capture thread for visualization
+                                if self.stream_server:
+                                    self.stream_server._start_capture_thread()
+                            elif not status_data.get("active") and stream_processor_started:
+                                stream_processor_started = False
+                                auto_tracking_enabled = False
+                                print("⏸ Stream processor stopped from UI - pausing auto-tracking")
+                    except Exception:
+                        pass  # Server might not be accessible yet
+                
+                # Auto-tracking mode (only if no manual command and enabled)
+                if not auto_tracking_enabled:
+                    time.sleep(0.5)  # Check less frequently when waiting
+                    continue
+                
                 if self.config.use_stream:
                     # Get result from stream
                     result = self.client.detect_realtime_stream()
+                    if not result.get("success"):
+                        error_msg = result.get('error', 'Unknown error')
+                        if "Stream processor not running" in str(error_msg):
+                            # Stream processor not started yet - wait
+                            if not stream_processor_started:
+                                time.sleep(1)
+                            else:
+                                print("⚠ Stream processor stopped")
+                                stream_processor_started = False
+                                auto_tracking_enabled = False
+                            continue
+                        else:
+                            print(f"⚠ Stream detection error: {error_msg}")
+                        time.sleep(0.5)
+                        continue
                 else:
                     # Fallback: capture and send image
                     image_bytes = self.camera.capture_jpeg()
                     if image_bytes is None:
-                        print("Failed to capture image")
+                        print("⚠ Failed to capture image from camera")
+                        time.sleep(0.5)
                         continue
                     
                     result = self.client.detect_realtime(
@@ -417,8 +1221,9 @@ class RobotController:
                     )
                 
                 if not result.get("success"):
-                    print(f"Detection failed: {result.get('error')}")
-                    time.sleep(0.1)
+                    error_msg = result.get('error', 'Unknown error')
+                    print(f"⚠ Detection failed: {error_msg}")
+                    time.sleep(0.5)
                     continue
                 
                 # Process result
@@ -474,6 +1279,18 @@ class RobotController:
         print(f"  Target: {self.config.target_class}")
         print("  5-Direction Navigation")
         print("=" * 50 + "\n")
+        
+        # Start stream server for live feed (always available)
+        if self.config.use_stream:
+            print("Starting live feed stream server...")
+            if not self._start_stream_server():
+                print("⚠ Stream server failed, live feed will not be available")
+                self.config.use_stream = False
+            else:
+                print(f"✓ Live feed available at {self.stream_url}")
+                # Start capture thread immediately for live feed
+                if self.stream_server:
+                    self.stream_server._start_capture_thread()
         
         self.running = True
         
@@ -570,11 +1387,104 @@ class RobotController:
         self.motors.rotate_servo("center")
         return images
     
+    def run_manual_control(self):
+        """Run manual control mode - poll for commands from web UI."""
+        print("\n" + "=" * 50)
+        print("  MANUAL CONTROL MODE")
+        print("  Waiting for commands from web UI...")
+        print("=" * 50 + "\n")
+        
+        # Start stream server for live feed (always available)
+        if self.config.use_stream:
+            print("Starting live feed stream server...")
+            if not self._start_stream_server():
+                print("⚠ Stream server failed, live feed will not be available")
+                self.config.use_stream = False
+            else:
+                print(f"✓ Live feed available at {self.stream_url}")
+                # Start capture thread immediately for live feed (no detection needed)
+                if self.stream_server:
+                    self.stream_server._start_capture_thread()
+        
+        self.running = True
+        
+        try:
+            while self.running:
+                # Poll for manual control commands
+                command = self.client.poll_control_command()
+                
+                if command:
+                    print(f"📱 Received command: {command}")
+                    
+                    # Handle ALL UI commands
+                    try:
+                        if command == "stop":
+                            self.motors.stop()
+                            print("  ✓ Stopped")
+                            
+                        elif command == "forward":
+                            self.motors.move("center", 0.5)
+                            print("  ✓ Moving forward")
+                            
+                        elif command == "backward":
+                            # Backward: rotate 180° then move forward
+                            print("  ⚠ Backward: rotating 180° then moving")
+                            self.motors.rotate_180()
+                            time.sleep(0.3)
+                            self.motors.move("center", 0.5)
+                            
+                        elif command == "left":
+                            self.motors.move("left", 0.5)
+                            print("  ✓ Moving left")
+                            
+                        elif command == "right":
+                            self.motors.move("right", 0.5)
+                            print("  ✓ Moving right")
+                            
+                        elif command == "far_left":
+                            self.motors.move("far_left", 0.5)
+                            print("  ✓ Moving far left")
+                            
+                        elif command == "far_right":
+                            self.motors.move("far_right", 0.5)
+                            print("  ✓ Moving far right")
+                            
+                        elif command == "rotate_180":
+                            self.motors.rotate_180()
+                            print("  ✓ Rotated 180°")
+                            
+                        elif command == "servo_left":
+                            self.motors.rotate_servo("left")
+                            print("  ✓ Servo moved left")
+                            
+                        elif command == "servo_center":
+                            self.motors.rotate_servo("center")
+                            print("  ✓ Servo centered")
+                            
+                        elif command == "servo_right":
+                            self.motors.rotate_servo("right")
+                            print("  ✓ Servo moved right")
+                            
+                        else:
+                            print(f"  ⚠ Unknown command: {command}")
+                            
+                    except Exception as e:
+                        print(f"  ✗ Error executing command '{command}': {e}")
+                
+                time.sleep(0.1)  # Poll every 100ms
+                
+        except KeyboardInterrupt:
+            print("\nStopping manual control...")
+        finally:
+            self.motors.stop()
+    
     def run(self):
         """Run selected mode."""
         try:
             if self.config.mode == "realtime":
                 self.run_realtime()
+            elif self.config.mode == "manual":
+                self.run_manual_control()
             else:
                 self.run_multiview()
         finally:
@@ -598,8 +1508,8 @@ def main():
     parser.add_argument("--server", default="http://localhost:8000", help="Server URL")
     parser.add_argument("--port", default="/dev/ttyUSB0", help="Arduino serial port")
     parser.add_argument("--target", default="person", help="Target object class")
-    parser.add_argument("--mode", choices=["realtime", "multiview"], default="realtime",
-                        help="Detection mode")
+    parser.add_argument("--mode", choices=["realtime", "multiview", "manual"], default="realtime",
+                        help="Detection mode (realtime, multiview, or manual)")
     parser.add_argument("--confidence", type=float, default=0.4, help="Confidence threshold")
     parser.add_argument("--camera", type=int, default=0, help="USB camera index (default: 0)")
     parser.add_argument("--stream-port", type=int, default=8080, help="Stream server port (default: 8080)")

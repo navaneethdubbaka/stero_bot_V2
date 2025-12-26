@@ -28,7 +28,7 @@ import requests
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
 from ultralytics import YOLO
 import torch
@@ -860,6 +860,652 @@ async def reset_tracker():
     global tracker
     tracker = ServerTracker()
     return {"success": True, "message": "Tracker reset"}
+
+
+# === Manual Control Endpoints ===
+
+# Store manual control commands (simple queue)
+manual_control_queue = []
+manual_control_lock = threading.Lock()
+
+@app.post("/control/command")
+async def send_control_command(command: str = Form(...)):
+    """
+    Send manual control command to robot.
+    
+    Commands: stop, forward, backward, left, right, far_left, far_right, 
+              rotate_180, servo_left, servo_center, servo_right
+    """
+    valid_commands = [
+        "stop", "forward", "backward", "left", "right", 
+        "far_left", "far_right", "rotate_180",
+        "servo_left", "servo_center", "servo_right"
+    ]
+    
+    if command not in valid_commands:
+        raise HTTPException(status_code=400, detail=f"Invalid command. Valid: {valid_commands}")
+    
+    with manual_control_lock:
+        manual_control_queue.append(command)
+    
+    return {"success": True, "command": command, "message": f"Command '{command}' queued"}
+
+
+@app.get("/control/poll")
+async def poll_control_command():
+    """Poll for manual control commands (used by Pi client)."""
+    with manual_control_lock:
+        if manual_control_queue:
+            cmd = manual_control_queue.pop(0)
+            return {"command": cmd, "has_command": True}
+        return {"command": None, "has_command": False}
+
+
+@app.get("/control/clear")
+async def clear_control_queue():
+    """Clear all queued manual control commands."""
+    with manual_control_lock:
+        manual_control_queue.clear()
+    return {"success": True, "message": "Control queue cleared"}
+
+
+# === Web UI Endpoint ===
+
+@app.get("/ui", response_class=HTMLResponse)
+async def web_ui():
+    """Web UI for robot control."""
+    return get_web_ui_html()
+
+
+def get_web_ui_html():
+    """Generate web UI HTML."""
+    local_ip = get_local_ip()
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Vision Control Panel</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }}
+        
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+        
+        .header h1 {{
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }}
+        
+        .ip-display {{
+            background: rgba(255,255,255,0.2);
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 15px;
+            font-size: 1.2em;
+            font-family: monospace;
+        }}
+        
+        .content {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 30px;
+        }}
+        
+        .panel {{
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }}
+        
+        .panel h2 {{
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }}
+        
+        .control-group {{
+            margin-bottom: 20px;
+        }}
+        
+        .control-group label {{
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+        }}
+        
+        select, input {{
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }}
+        
+        select:focus, input:focus {{
+            outline: none;
+            border-color: #667eea;
+        }}
+        
+        .button-group {{
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 15px;
+        }}
+        
+        button {{
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            flex: 1;
+            min-width: 120px;
+        }}
+        
+        button:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }}
+        
+        button:active {{
+            transform: translateY(0);
+        }}
+        
+        .btn-primary {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        
+        .btn-success {{
+            background: #4ade80;
+            color: white;
+        }}
+        
+        .btn-danger {{
+            background: #ef4444;
+            color: white;
+        }}
+        
+        .btn-warning {{
+            background: #f59e0b;
+            color: white;
+        }}
+        
+        .btn-info {{
+            background: #3b82f6;
+            color: white;
+        }}
+        
+        .btn-secondary {{
+            background: #6b7280;
+            color: white;
+        }}
+        
+        .video-container {{
+            position: relative;
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+            aspect-ratio: 4/3;
+            margin-top: 15px;
+        }}
+        
+        .video-container img {{
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }}
+        
+        .video-placeholder {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #999;
+            font-size: 1.2em;
+        }}
+        
+        .status-display {{
+            background: #1a1a2e;
+            color: #4ade80;
+            padding: 15px;
+            border-radius: 10px;
+            font-family: monospace;
+            font-size: 0.9em;
+            margin-top: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+        }}
+        
+        .status-line {{
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #4ade80;
+            padding-left: 10px;
+        }}
+        
+        .manual-control {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 15px;
+        }}
+        
+        .manual-control button {{
+            padding: 20px;
+            font-size: 1.2em;
+            min-width: auto;
+        }}
+        
+        .center-btn {{
+            grid-column: 2;
+        }}
+        
+        .full-width {{
+            grid-column: 1 / -1;
+        }}
+        
+        .status-badge {{
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 600;
+            margin-left: 10px;
+        }}
+        
+        .status-online {{
+            background: #4ade80;
+            color: white;
+        }}
+        
+        .status-offline {{
+            background: #ef4444;
+            color: white;
+        }}
+        
+        @media (max-width: 968px) {{
+            .content {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Robot Vision Control Panel</h1>
+            <div class="ip-display">
+                Server IP: <strong id="serverIp">{local_ip if local_ip else 'localhost'}</strong>:8000
+            </div>
+        </div>
+        
+        <div class="content">
+            <!-- Control Panel -->
+            <div class="panel">
+                <h2>🎮 Control Panel</h2>
+                
+                <div class="control-group">
+                    <label>Operation Mode</label>
+                    <select id="modeSelect">
+                        <option value="realtime">Real-time Tracking</option>
+                        <option value="multiview">Multi-view Finding</option>
+                        <option value="manual">Manual Control</option>
+                    </select>
+                </div>
+                
+                <div class="control-group">
+                    <label>Target Object to Track</label>
+                    <input type="text" id="targetClassInput" placeholder="Enter object name (e.g., person, car, dog)" value="person" list="objectSuggestions">
+                    <datalist id="objectSuggestions">
+                        <option value="person">
+                        <option value="car">
+                        <option value="dog">
+                        <option value="cat">
+                        <option value="bicycle">
+                        <option value="motorcycle">
+                        <option value="bus">
+                        <option value="truck">
+                        <option value="bird">
+                        <option value="horse">
+                    </datalist>
+                    <small style="color: #666; font-size: 0.85em; margin-top: 5px; display: block;">
+                        Enter any COCO class name. Common: person, car, dog, cat, bicycle, etc.
+                    </small>
+                </div>
+                
+                <div class="control-group">
+                    <label>Confidence Threshold</label>
+                    <input type="range" id="confidence" min="0.1" max="1.0" step="0.1" value="0.4">
+                    <span id="confidenceValue">0.4</span>
+                </div>
+                
+                <div class="control-group">
+                    <label>Pi Stream URL</label>
+                    <input type="text" id="streamUrl" placeholder="http://192.168.1.105:8080" value="">
+                </div>
+                
+                <div class="button-group">
+                    <button class="btn-success" onclick="startOperation()">▶ Start</button>
+                    <button class="btn-danger" onclick="stopOperation()">⏹ Stop</button>
+                    <button class="btn-info" onclick="toggleLiveFeed()">📹 Live Feed</button>
+                </div>
+                
+                <div class="status-display" id="statusDisplay">
+                    <div class="status-line">Ready. Select mode and click Start.</div>
+                </div>
+            </div>
+            
+            <!-- Video Feed & Manual Control -->
+            <div class="panel">
+                <h2>📹 Live Feed <span class="status-badge status-offline" id="feedStatus">OFF</span></h2>
+                
+                <div class="video-container" id="videoContainer">
+                    <div class="video-placeholder">Click "Live Feed" to start</div>
+                </div>
+                
+                <!-- Real-time Tracking Display -->
+                <div id="trackingDisplay" style="display: none; margin-top: 15px; background: #f8f9fa; padding: 15px; border-radius: 10px; border: 2px solid #667eea;">
+                    <h3 style="margin-bottom: 10px; color: #667eea;">🎯 Real-time Tracking</h3>
+                    <div id="trackingInfo" style="font-family: monospace; font-size: 0.9em; line-height: 1.8;">
+                        <div><strong>Status:</strong> <span id="trackingStatus" style="font-weight: bold;">Waiting...</span></div>
+                        <div><strong>Direction:</strong> <span id="trackingDirection">-</span></div>
+                        <div><strong>Confidence:</strong> <span id="trackingConfidence">-</span></div>
+                        <div><strong>Distance:</strong> <span id="trackingDistance">-</span></div>
+                        <div><strong>Velocity:</strong> <span id="trackingVelocity">-</span></div>
+                    </div>
+                </div>
+                
+                <div id="manualControlPanel" style="display: none; margin-top: 20px;">
+                    <h3 style="margin-bottom: 15px; color: #667eea;">🎮 Manual Control</h3>
+                    <div class="manual-control">
+                        <button class="btn-secondary" onclick="sendCommand('servo_left')">↖ Servo L</button>
+                        <button class="btn-primary" onclick="sendCommand('forward')">↑ Forward</button>
+                        <button class="btn-secondary" onclick="sendCommand('servo_right')">↗ Servo R</button>
+                        
+                        <button class="btn-primary" onclick="sendCommand('left')">← Left</button>
+                        <button class="btn-danger" onclick="sendCommand('stop')">⏹ Stop</button>
+                        <button class="btn-primary" onclick="sendCommand('right')">→ Right</button>
+                        
+                        <button class="btn-secondary" onclick="sendCommand('far_left')">↖ Far Left</button>
+                        <button class="btn-primary" onclick="sendCommand('backward')">↓ Backward</button>
+                        <button class="btn-secondary" onclick="sendCommand('far_right')">↗ Far Right</button>
+                        
+                        <button class="btn-warning full-width" onclick="sendCommand('rotate_180')">🔄 Rotate 180°</button>
+                        <button class="btn-secondary full-width" onclick="sendCommand('servo_center')">🎯 Servo Center</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = window.location.origin;
+        let liveFeedInterval = null;
+        let statusInterval = null;
+        let currentMode = 'manual';
+        
+        // Update confidence display
+        document.getElementById('confidence').addEventListener('input', (e) => {{
+            document.getElementById('confidenceValue').textContent = e.target.value;
+        }});
+        
+        // Mode change handler
+        document.getElementById('modeSelect').addEventListener('change', (e) => {{
+            currentMode = e.target.value;
+            const manualPanel = document.getElementById('manualControlPanel');
+            if (e.target.value === 'manual') {{
+                manualPanel.style.display = 'block';
+            }} else {{
+                manualPanel.style.display = 'none';
+            }}
+        }});
+        
+        function addStatus(message, type = 'info') {{
+            const statusDisplay = document.getElementById('statusDisplay');
+            const line = document.createElement('div');
+            line.className = 'status-line';
+            line.textContent = `[${{new Date().toLocaleTimeString()}}] ${{message}}`;
+            statusDisplay.appendChild(line);
+            statusDisplay.scrollTop = statusDisplay.scrollHeight;
+        }}
+        
+        async function startOperation() {{
+            const mode = document.getElementById('modeSelect').value;
+            const targetClass = document.getElementById('targetClassInput').value.trim().toLowerCase();
+            const confidence = parseFloat(document.getElementById('confidence').value);
+            const streamUrl = document.getElementById('streamUrl').value;
+            
+            if (!targetClass) {{
+                alert('Please enter an object name to track');
+                return;
+            }}
+            
+            addStatus(`Starting ${{mode}} mode for: ${{targetClass}}...`);
+            
+            try {{
+                if (mode === 'realtime' || mode === 'multiview') {{
+                    if (!streamUrl) {{
+                        alert('Please enter Pi Stream URL');
+                        return;
+                    }}
+                    
+                    const response = await fetch(`${{API_BASE}}/stream/start`, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{
+                            stream_url: streamUrl,
+                            target_class: targetClass,
+                            confidence: confidence,
+                            interval_ms: 100
+                        }})
+                    }});
+                    
+                    const data = await response.json();
+                    if (data.success) {{
+                        addStatus(`Stream started: ${{streamUrl}}`);
+                        addStatus(`Tracking: ${{targetClass}}`);
+                        document.getElementById('trackingDisplay').style.display = 'block';
+                        startStatusPolling();
+                    }} else {{
+                        addStatus(`Error: ${{data.detail || 'Failed to start'}}`, 'error');
+                    }}
+                }} else {{
+                    addStatus('Manual control mode active');
+                }}
+            }} catch (error) {{
+                addStatus(`Error: ${{error.message}}`, 'error');
+            }}
+        }}
+        
+        async function stopOperation() {{
+            addStatus('Stopping operation...');
+            
+            try {{
+                await fetch(`${{API_BASE}}/stream/stop`, {{ method: 'POST' }});
+                stopStatusPolling();
+                document.getElementById('trackingDisplay').style.display = 'none';
+                addStatus('Operation stopped');
+            }} catch (error) {{
+                addStatus(`Error: ${{error.message}}`, 'error');
+            }}
+        }}
+        
+        // Load available classes on page load
+        async function loadAvailableClasses() {{
+            try {{
+                const response = await fetch(`${{API_BASE}}/classes`);
+                const data = await response.json();
+                const datalist = document.getElementById('objectSuggestions');
+                
+                // Clear existing options
+                datalist.innerHTML = '';
+                
+                // Add all classes to datalist
+                data.classes.forEach(className => {{
+                    const option = document.createElement('option');
+                    option.value = className;
+                    datalist.appendChild(option);
+                }});
+                
+                addStatus(`Loaded ${{data.classes.length}} available object classes`);
+            }} catch (error) {{
+                console.error('Failed to load classes:', error);
+            }}
+        }}
+        
+        function toggleLiveFeed() {{
+            const streamUrl = document.getElementById('streamUrl').value;
+            if (!streamUrl) {{
+                alert('Please enter Pi Stream URL');
+                return;
+            }}
+            
+            if (liveFeedInterval) {{
+                clearInterval(liveFeedInterval);
+                liveFeedInterval = null;
+                document.getElementById('feedStatus').textContent = 'OFF';
+                document.getElementById('feedStatus').className = 'status-badge status-offline';
+                document.getElementById('videoContainer').innerHTML = '<div class="video-placeholder">Click "Live Feed" to start</div>';
+                addStatus('Live feed stopped');
+            }} else {{
+                // Remove trailing slash from streamUrl if present to avoid double slash
+                const cleanUrl = streamUrl.replace(/\/$/, '');
+                const feedUrl = `${{cleanUrl}}/video_feed`;
+                console.log('Loading live feed from:', feedUrl);
+                const img = document.createElement('img');
+                img.src = feedUrl;
+                img.onerror = () => {{
+                    addStatus('Failed to load feed. Check stream URL and ensure Pi stream server is running.', 'error');
+                    console.error('Failed to load feed from:', feedUrl);
+                    toggleLiveFeed();
+                }};
+                
+                document.getElementById('videoContainer').innerHTML = '';
+                document.getElementById('videoContainer').appendChild(img);
+                document.getElementById('feedStatus').textContent = 'ON';
+                document.getElementById('feedStatus').className = 'status-badge status-online';
+                addStatus('Live feed started');
+            }}
+        }}
+        
+        async function sendCommand(command) {{
+            try {{
+                const formData = new FormData();
+                formData.append('command', command);
+                
+                const response = await fetch(`${{API_BASE}}/control/command`, {{
+                    method: 'POST',
+                    body: formData
+                }});
+                
+                const data = await response.json();
+                if (data.success) {{
+                    addStatus(`Command sent: ${{command}}`);
+                }} else {{
+                    addStatus(`Error: ${{data.detail}}`, 'error');
+                }}
+            }} catch (error) {{
+                addStatus(`Error: ${{error.message}}`, 'error');
+            }}
+        }}
+        
+        function startStatusPolling() {{
+            if (statusInterval) return;
+            
+            statusInterval = setInterval(async () => {{
+                try {{
+                    const response = await fetch(`${{API_BASE}}/detect/realtime/stream`);
+                    if (response.status === 200) {{
+                        const data = await response.json();
+                        
+                        // Update tracking display
+                        const trackingDisplay = document.getElementById('trackingDisplay');
+                        if (data.target_found) {{
+                            document.getElementById('trackingStatus').textContent = '✅ Tracking';
+                            document.getElementById('trackingStatus').style.color = '#4ade80';
+                            document.getElementById('trackingDirection').textContent = data.direction.toUpperCase();
+                            document.getElementById('trackingConfidence').textContent = (data.target_detection?.confidence * 100).toFixed(1) + '%';
+                            document.getElementById('trackingDistance').textContent = (data.distance_ratio * 100).toFixed(1) + '%';
+                            
+                            if (data.tracking) {{
+                                const vel = data.tracking.velocity;
+                                document.getElementById('trackingVelocity').textContent = `(${{vel[0].toFixed(1)}}, ${{vel[1].toFixed(1)}}) px/s`;
+                            }} else {{
+                                document.getElementById('trackingVelocity').textContent = 'Calculating...';
+                            }}
+                            
+                            if (data.reached) {{
+                                document.getElementById('trackingStatus').textContent = '🎯 REACHED!';
+                                document.getElementById('trackingStatus').style.color = '#f59e0b';
+                            }}
+                            
+                            addStatus(`Target found: ${{data.direction}} (Conf: ${{(data.target_detection?.confidence * 100).toFixed(1)}}%)`);
+                        }} else {{
+                            document.getElementById('trackingStatus').textContent = '❌ Not Found';
+                            document.getElementById('trackingStatus').style.color = '#ef4444';
+                            document.getElementById('trackingDirection').textContent = '-';
+                            document.getElementById('trackingConfidence').textContent = '-';
+                            document.getElementById('trackingDistance').textContent = '-';
+                            document.getElementById('trackingVelocity').textContent = '-';
+                        }}
+                    }}
+                }} catch (error) {{
+                    // Silent fail
+                }}
+            }}, 500); // Poll every 500ms for real-time updates
+        }}
+        
+        function stopStatusPolling() {{
+            if (statusInterval) {{
+                clearInterval(statusInterval);
+                statusInterval = null;
+            }}
+        }}
+        
+        // Initialize
+        addStatus('Control panel ready');
+        loadAvailableClasses();
+    </script>
+</body>
+</html>
+"""
 
 
 # === Run Server ===

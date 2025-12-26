@@ -18,6 +18,8 @@ import io
 import time
 import threading
 import argparse
+import os
+import glob
 from typing import Optional
 from dataclasses import dataclass
 
@@ -63,18 +65,115 @@ class CameraStream:
         self._init_camera()
         self._start_capture_thread()
     
+    def _list_video_devices(self):
+        """List available video devices."""
+        video_devices = []
+        for device_path in glob.glob('/dev/video*'):
+            if os.path.exists(device_path):
+                video_devices.append(device_path)
+        return sorted(video_devices)
+    
     def _init_camera(self):
         """Initialize USB webcam."""
         print(f"Initializing USB Webcam (index {self.config.camera_index})...")
-        self.camera = cv2.VideoCapture(self.config.camera_index)
-        if not self.camera.isOpened():
-            print(f"Warning: Camera index {self.config.camera_index} failed, trying next...")
-            self.camera = cv2.VideoCapture(self.config.camera_index + 1)
+        
+        # First, check available video devices
+        video_devices = self._list_video_devices()
+        if video_devices:
+            print(f"Found video devices: {', '.join(video_devices)}")
+        else:
+            print("⚠ No /dev/video* devices found!")
+            print("  Troubleshooting:")
+            print("    1. Check camera is connected: lsusb")
+            print("    2. Check permissions: ls -l /dev/video*")
+            print("    3. Add user to video group: sudo usermod -a -G video $USER")
+            print("    4. Reboot or logout/login after adding to group")
+        
+        camera_found = False
+        
+        # Method 1: Try by device path first (more reliable)
+        if video_devices:
+            print("\nTrying to open by device path...")
+            for device_path in video_devices:
+                try:
+                    # Try opening with device path
+                    self.camera = cv2.VideoCapture(device_path)
+                    if self.camera.isOpened():
+                        ret, test_frame = self.camera.read()
+                        if ret and test_frame is not None:
+                            camera_found = True
+                            print(f"✓ Camera opened successfully: {device_path}")
+                            break
+                        else:
+                            self.camera.release()
+                            print(f"  {device_path} opened but cannot read frames")
+                    else:
+                        self.camera.release()
+                except Exception as e:
+                    print(f"  Error opening {device_path}: {e}")
+        
+        # Method 2: Try by index if device path failed
+        if not camera_found:
+            print("\nTrying to open by index...")
+            for idx in range(self.config.camera_index, self.config.camera_index + 5):
+                try:
+                    self.camera = cv2.VideoCapture(idx)
+                    if self.camera.isOpened():
+                        ret, test_frame = self.camera.read()
+                        if ret and test_frame is not None:
+                            camera_found = True
+                            self.config.camera_index = idx
+                            print(f"✓ USB Webcam found and working (index {idx})")
+                            break
+                        else:
+                            self.camera.release()
+                            print(f"  Camera index {idx} opened but cannot read frames")
+                    else:
+                        if idx == self.config.camera_index:
+                            print(f"  Camera index {idx} not available")
+                except Exception as e:
+                    print(f"  Error with index {idx}: {e}")
+        
+        if not camera_found:
+            error_msg = "\n" + "=" * 60
+            error_msg += "\n❌ CAMERA INITIALIZATION FAILED"
+            error_msg += "\n" + "=" * 60
+            error_msg += "\n\nTroubleshooting Steps:"
+            error_msg += "\n1. Check camera connection:"
+            error_msg += "\n   lsusb | grep -i camera"
+            error_msg += "\n   lsusb | grep -i video"
+            error_msg += "\n\n2. Check video devices:"
+            error_msg += "\n   ls -l /dev/video*"
+            error_msg += "\n\n3. Fix permissions (if needed):"
+            error_msg += "\n   sudo usermod -a -G video $USER"
+            error_msg += "\n   # Then logout and login again"
+            error_msg += "\n\n4. Test camera manually:"
+            error_msg += "\n   v4l2-ctl --list-devices"
+            error_msg += "\n   v4l2-ctl --device=/dev/video0 --all"
+            error_msg += "\n\n5. Try different camera:"
+            error_msg += "\n   python rpi_stream_server.py --camera 1"
+            error_msg += "\n\n6. Check if another process is using camera:"
+            error_msg += "\n   lsof | grep video"
+            error_msg += "\n" + "=" * 60
+            raise RuntimeError(error_msg)
+        
+        # Set camera properties
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         self.camera.set(cv2.CAP_PROP_FPS, self.config.fps)
+        
+        # Verify settings
+        actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
         time.sleep(2)  # Camera warm-up
-        print(f"✓ USB Webcam ready ({self.config.width}x{self.config.height})")
+        
+        # Test capture
+        ret, frame = self.camera.read()
+        if not ret or frame is None:
+            raise RuntimeError("Camera initialized but cannot capture frames")
+        
+        print(f"✓ USB Webcam ready ({actual_width}x{actual_height})")
+        print(f"✓ Camera test capture successful")
     
     def _capture_loop(self):
         """Continuous capture loop running in background thread."""

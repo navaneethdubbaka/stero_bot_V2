@@ -17,6 +17,10 @@ opencv-python>=4.8.0
 # Numerical operations
 numpy>=1.24.0
 
+# FastAPI for integrated stream server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
 # Optional: For better performance on Pi
 # Consider installing these system packages via apt:
 # sudo apt-get update
