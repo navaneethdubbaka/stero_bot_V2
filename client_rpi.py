@@ -1232,35 +1232,85 @@ class RobotController:
                 reached = result.get("reached", False)
                 
                 if target_found:
+                    # Reset search state when target is found
+                    no_target_count = 0
+                    current_servo_index = 1  # Reset to center
+                    search_state = "servo_scan"
+                    
                     tracking = result.get("tracking", {})
                     velocity = tracking.get("velocity", [0, 0]) if tracking else [0, 0]
                     area = result.get("distance_ratio", 0)
                     
-                    print(f"Target: dir={direction}, area={area:.1%}, vel=({velocity[0]:.1f}, {velocity[1]:.1f})")
+                    print(f"🎯 Target: dir={direction}, area={area:.1%}, vel=({velocity[0]:.1f}, {velocity[1]:.1f})")
                     
                     if reached:
                         print("🎉 TARGET REACHED!")
                         self.motors.stop()
                     else:
-                        # Smart movement with velocity prediction
+                        # Smart movement with velocity prediction - continuously track and move
                         current_time = time.time()
                         if current_time - last_command_time > command_cooldown:
                             if direction == "left":
                                 if velocity[0] > 50:  # Moving right
-                                    print("  Object moving to center, waiting...")
+                                    print("  → Object moving to center, waiting...")
                                 else:
+                                    print("  → Moving left to track target")
                                     self.motors.move("left", self.config.movement_duration)
                             elif direction == "right":
                                 if velocity[0] < -50:  # Moving left
-                                    print("  Object moving to center, waiting...")
+                                    print("  → Object moving to center, waiting...")
                                 else:
+                                    print("  → Moving right to track target")
                                     self.motors.move("right", self.config.movement_duration)
                             else:  # center
+                                print("  → Moving forward to track target")
                                 self.motors.move("center", self.config.movement_duration)
                             
                             last_command_time = current_time
                 else:
-                    print("Target not found - searching...")
+                    # Target not found - implement active search behavior
+                    no_target_count += 1
+                    current_time = time.time()
+                    
+                    # Active search pattern: servo scan → rotate robot → move forward
+                    if current_time - last_search_action_time > search_cooldown:
+                        if search_state == "servo_scan":
+                            # Rotate servo to scan different angles
+                            servo_pos = servo_positions[current_servo_index]
+                            print(f"🔍 Searching: Rotating servo to {servo_pos}")
+                            self.motors.rotate_servo(servo_pos)
+                            
+                            # Move to next servo position
+                            current_servo_index = (current_servo_index + 1) % len(servo_positions)
+                            
+                            # After scanning all positions, try rotating robot
+                            if current_servo_index == 1:  # Back to center, completed one full scan
+                                if no_target_count > 15:  # After ~15 seconds of no target
+                                    search_state = "rotate"
+                                    print("  → Servo scan complete, rotating robot to search new area")
+                                else:
+                                    print("  → Continuing servo scan...")
+                            
+                            last_search_action_time = current_time
+                            
+                        elif search_state == "rotate":
+                            # Rotate robot 90 degrees to search new area
+                            print("🔍 Searching: Rotating robot 90°")
+                            self.motors.move("left", 0.8)  # Turn left for ~0.8 seconds = ~90 degrees
+                            search_state = "move_forward"
+                            last_search_action_time = current_time
+                            
+                        elif search_state == "move_forward":
+                            # Move forward a bit to check new area
+                            print("🔍 Searching: Moving forward to explore")
+                            self.motors.move("center", 0.5)
+                            search_state = "servo_scan"  # Reset to servo scan
+                            current_servo_index = 1  # Reset servo to center
+                            last_search_action_time = current_time
+                    else:
+                        # Still in cooldown, just print status
+                        if no_target_count % 10 == 0:  # Print every 10 frames (~1 second)
+                            print(f"🔍 Target not found - searching... (count: {no_target_count})")
                 
                 time.sleep(0.1)
                 
